@@ -13,43 +13,19 @@ import { createInteractiveModeContext } from "../../helpers/interactive-mode-con
 
 import { cfgCompactionIdleEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { cfgRecapEnabled, cfgRecapIdleSeconds } from "@oh-my-pi/pi-coding-agent/modes/settings";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
-import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
-
-async function flushMicrotasks(): Promise<void> {
-	for (let i = 0; i < 50; i++) {
-		await Promise.resolve();
-	}
-}
+import {
+	createAssistantMessage,
+	createIngressHarness,
+	createRecapRunner,
+	disposeRecapFixtures,
+	flushMicrotasks,
+	RECAP_ACTION_EXTENSION,
+	RECAP_SKIP_EXTENSION,
+	setStreaming,
+} from "../../helpers/recap-ingress";
 
 /** `present` stand-in for spies: the controller only hands content over. */
 function recordPresented(_content: Component | readonly Component[]): void {}
-
-function createAssistantMessage(): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [{ type: "text", text: "done" }],
-		api: "anthropic-messages",
-		provider: "anthropic",
-		model: "claude-sonnet-4-5",
-		usage: {
-			input: 200,
-			output: 10,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 210,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
-		timestamp: Date.now(),
-	};
-}
 
 function createContext(
 	options: {
@@ -107,58 +83,6 @@ function createContext(
 	});
 }
 
-/** The stub's `isStreaming` is a data property; redefine it since the real type exposes a getter. */
-function setStreaming(context: { session: object }, value: boolean): void {
-	Object.defineProperty(context.session, "isStreaming", { value, configurable: true });
-}
-
-/** Real `before_idle_recap` handlers: the actual ExtensionRunner path, not a stand-in echo. */
-const RECAP_ACTION_EXTENSION = `
-export default function (pi) {
-	pi.on("before_idle_recap", async () => ({ prompt: "Run the capture-context skill now." }));
-}
-`;
-const RECAP_SKIP_EXTENSION = `
-export default function (pi) {
-	pi.on("before_idle_recap", async () => ({ skip: true }));
-}
-`;
-
-/** Cleanups for real runners built per test (auth db, temp extension dir). */
-const cleanups: Array<() => void> = [];
-
-/**
- * Loads a real ExtensionRunner from a temp extension file. Setup runs on real
- * timers because extension loading does file I/O; fake timers are restored after.
- */
-async function createRecapRunner(extensionSource: string): Promise<ExtensionRunner> {
-	vi.useRealTimers();
-	const dir = TempDir.createSync("@idle-recap-");
-	const authStorage = await AuthStorage.create(path.join(dir.path(), "auth.db"));
-	cleanups.push(() => {
-		authStorage.close();
-		dir.removeSync();
-	});
-	const extensionPath = dir.join("before-idle-recap.ts");
-	fs.writeFileSync(extensionPath, extensionSource);
-	const loaded = await loadExtensions([extensionPath], dir.path());
-	expect(loaded.errors).toEqual([]);
-	const runner = new ExtensionRunner(
-		loaded.extensions,
-		loaded.runtime,
-		dir.path(),
-		SessionManager.inMemory(dir.path()),
-		new ModelRegistry(authStorage),
-		undefined,
-		undefined,
-		undefined,
-		undefined,
-		undefined,
-	);
-	vi.useFakeTimers();
-	return runner;
-}
-
 describe("EventController idle compaction teardown", () => {
 	beforeEach(async () => {
 		await initTheme();
@@ -177,7 +101,7 @@ describe("EventController idle compaction teardown", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
-		for (const cleanup of cleanups.splice(0)) cleanup();
+		disposeRecapFixtures();
 		resetSettingsForTest();
 	});
 
@@ -492,31 +416,196 @@ describe("EventController idle compaction teardown", () => {
 		controller.dispose();
 	});
 
-	it("a draft present at settle arms nothing, and a draft typed mid-window cancels without rearming", async () => {
+	it("a draft present at settle arms nothing; clearing it re-arms the configured delay", async () => {
 		cfgRecapEnabled.override(settings, true);
 		cfgCompactionIdleEnabled.override(settings, false);
 		cfgRecapIdleSeconds.override(settings, 1);
 		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap.", assistantMessage: createAssistantMessage() }));
-		const context = createContext({ runEphemeralTurn });
-		let draft = "half-typed";
-		context.editor.getText = () => draft;
-		const controller = new EventController(context);
-
-		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		const harness = createIngressHarness({ runEphemeralTurn });
+		harness.typeDraft("half-typed");
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
 		vi.advanceTimersByTime(5_000);
 		await flushMicrotasks();
 		expect(runEphemeralTurn).not.toHaveBeenCalled();
 
-		// A new turn settles with an empty editor and arms; typing then cancels it.
-		draft = "";
-		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
-		draft = "typing";
-		controller.cancelIdleRecapForDraft();
-		draft = "";
-		vi.advanceTimersByTime(5_000);
+		// Clearing the draft is an empty transition: the configured delay starts now.
+		harness.typeDraft("");
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		harness.events.dispose();
+	});
+
+	it("typing then clearing inside the idle window re-arms the configured delay and recaps", async () => {
+		cfgRecapEnabled.override(settings, true);
+		cfgCompactionIdleEnabled.override(settings, false);
+		cfgRecapIdleSeconds.override(settings, 1);
+		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap.", assistantMessage: createAssistantMessage() }));
+		const harness = createIngressHarness({ runEphemeralTurn });
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		harness.typeDraft("x");
+		harness.typeDraft("");
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		harness.events.dispose();
+	});
+
+	it("a draft held across the original deadline re-arms the full delay once it clears", async () => {
+		cfgRecapEnabled.override(settings, true);
+		cfgCompactionIdleEnabled.override(settings, false);
+		cfgRecapIdleSeconds.override(settings, 1);
+		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap.", assistantMessage: createAssistantMessage() }));
+		const harness = createIngressHarness({ runEphemeralTurn });
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(500);
+		harness.typeDraft("draft");
+		// Past the original deadline with the draft still held: nothing may fire.
+		vi.advanceTimersByTime(1_000);
 		await flushMicrotasks();
 		expect(runEphemeralTurn).not.toHaveBeenCalled();
-		controller.dispose();
+
+		harness.typeDraft("");
+		vi.advanceTimersByTime(999);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		harness.events.dispose();
+	});
+
+	it("a consumed cycle stays consumed through typing and clearing a draft", async () => {
+		cfgRecapEnabled.override(settings, true);
+		cfgCompactionIdleEnabled.override(settings, false);
+		cfgRecapIdleSeconds.override(settings, 1);
+		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap.", assistantMessage: createAssistantMessage() }));
+		const harness = createIngressHarness({ runEphemeralTurn });
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+
+		harness.typeDraft("x");
+		harness.typeDraft("");
+		vi.advanceTimersByTime(10_000);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		harness.events.dispose();
+	});
+
+	it("a session repoint resets the open window, so clearing a draft on the new session cannot arm it", async () => {
+		cfgRecapEnabled.override(settings, true);
+		cfgCompactionIdleEnabled.override(settings, false);
+		cfgRecapIdleSeconds.override(settings, 1);
+		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap.", assistantMessage: createAssistantMessage() }));
+		const harness = createIngressHarness({ runEphemeralTurn });
+		let sessionId = "session-a";
+		Object.defineProperty(harness.context.sessionManager, "getSessionId", {
+			value: () => sessionId,
+			configurable: true,
+		});
+
+		// Session A settles: its window opens and its cycle is still unconsumed.
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+
+		// Repoint to session B (focus or new-session path) before A's window fires.
+		sessionId = "session-b";
+		harness.events.resetTranscriptAnchors();
+		harness.typeDraft("x");
+		harness.typeDraft("");
+		vi.advanceTimersByTime(5_000);
+		await flushMicrotasks();
+		// B never settled: the empty transition must not arm a window for it.
+		expect(runEphemeralTurn).not.toHaveBeenCalled();
+
+		// B's own terminal settle opens its window and recaps exactly once.
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+
+		// The repoint never consumed A's cycle: returning to A and settling recaps it once more.
+		sessionId = "session-a";
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(2);
+		harness.events.dispose();
+	});
+
+	it("an unconfigured session (no model) runs neither the pre-recap prompt nor a recap, and keeps its first cycle", async () => {
+		cfgRecapEnabled.override(settings, true);
+		cfgCompactionIdleEnabled.override(settings, false);
+		cfgRecapIdleSeconds.override(settings, 1);
+		const runner = await createRecapRunner(RECAP_ACTION_EXTENSION);
+		const prompt = vi.fn(async () => true);
+		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap.", assistantMessage: createAssistantMessage() }));
+		const present = vi.fn();
+		const harness = createIngressHarness({
+			prompt,
+			runEphemeralTurn,
+			present,
+			extensionRunner: runner,
+			lastAssistantMessage: createAssistantMessage(),
+		});
+		Object.defineProperty(harness.context.session, "model", { value: undefined, configurable: true });
+
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(prompt).not.toHaveBeenCalled();
+		expect(runEphemeralTurn).not.toHaveBeenCalled();
+
+		// Once configured, the next terminal settle still gets the first cycle, and it runs once.
+		Object.defineProperty(harness.context.session, "model", {
+			value: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			configurable: true,
+		});
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		expect(present.mock.calls.some(([content]) => content instanceof RecapNotice)).toBe(true);
+		harness.events.dispose();
+	});
+
+	it("an empty history runs neither the pre-recap prompt nor a recap, and keeps its first cycle", async () => {
+		cfgRecapEnabled.override(settings, true);
+		cfgCompactionIdleEnabled.override(settings, false);
+		cfgRecapIdleSeconds.override(settings, 1);
+		const runner = await createRecapRunner(RECAP_ACTION_EXTENSION);
+		const prompt = vi.fn(async () => true);
+		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap.", assistantMessage: createAssistantMessage() }));
+		const present = vi.fn();
+		const harness = createIngressHarness({
+			prompt,
+			runEphemeralTurn,
+			present,
+			extensionRunner: runner,
+			lastAssistantMessage: createAssistantMessage(),
+		});
+		Object.defineProperty(harness.context.session, "messages", { value: [], configurable: true });
+
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(prompt).not.toHaveBeenCalled();
+		expect(runEphemeralTurn).not.toHaveBeenCalled();
+
+		// History arrives; the next terminal settle still gets the first cycle, and it runs once.
+		Object.defineProperty(harness.context.session, "messages", {
+			value: [createAssistantMessage()],
+			configurable: true,
+		});
+		await harness.events.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(1_000);
+		await flushMicrotasks();
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		expect(present.mock.calls.some(([content]) => content instanceof RecapNotice)).toBe(true);
+		harness.events.dispose();
 	});
 
 	it("a pre-recap action that reports failure consumes the cycle: no recap and no retry from later settles", async () => {

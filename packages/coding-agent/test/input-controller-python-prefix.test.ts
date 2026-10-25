@@ -41,7 +41,7 @@ function createContext() {
 	};
 
 	const ctx = {
-		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
+		eventController: { onUserInput: vi.fn(), onEditorChange: vi.fn() },
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: { requestRender: vi.fn() } as unknown as InteractiveModeContext["ui"],
 		session: {

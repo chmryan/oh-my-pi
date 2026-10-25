@@ -482,11 +482,19 @@ export class EventController {
 	}
 
 	/**
-	 * A non-empty editor draft cancels pending or in-flight recap work for the
-	 * current cycle without rearming it: typing alone does not start a new cycle.
+	 * Every editor change reports the full draft. A non-empty draft cancels pending or
+	 * in-flight recap work but keeps the pending marker, so clearing the draft re-arms
+	 * the configured delay for the same cycle. Clearing refreshes the window only while
+	 * the marker is set, no timer is running, and no turn is live. A fired cycle has no
+	 * marker (its timer cleared it), so clearing after it stays a no-op.
 	 */
-	cancelIdleRecapForDraft(): void {
-		this.#cancelIdleRecapWindow();
+	onEditorChange(text: string): void {
+		if (text.trim()) {
+			this.#cancelIdleRecap();
+			return;
+		}
+		if (!this.#idleRecapPending || this.#idleRecapTimer || this.ctx.viewSession.isStreaming) return;
+		this.#scheduleIdleRecap();
 	}
 
 	dispose(): void {
@@ -996,7 +1004,7 @@ export class EventController {
 		this.#restorePinnedErrorInline = true;
 		this.#retryPending = this.ctx.viewSession.isRetrying;
 		this.#cancelIdleCompaction();
-		this.#cancelIdleRecap();
+		this.#cancelIdleRecapWindow();
 		this.composerPrediction.cancel();
 		for (const timer of this.#ircExpiryTimers.values()) {
 			clearTimeout(timer);
@@ -2936,6 +2944,7 @@ export class EventController {
 	async #fireIdleRecap(): Promise<void> {
 		if (!this.#idleConditionsHold()) return;
 		const session = this.ctx.viewSession;
+		if (!session.model || session.messages.length === 0) return;
 		const sessionId = this.ctx.sessionManager.getSessionId();
 		this.#consumeRecapCycle(session, sessionId);
 		const abort = new AbortController();

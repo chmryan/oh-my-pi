@@ -23,7 +23,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 		let editorText = "[Paste #1, +5 lines]";
 		const prompt = vi.fn(async (_text: string, _options?: PromptOptionsLike) => {});
 		const ctx = {
-			eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
+			eventController: { onUserInput: vi.fn(), onEditorChange: vi.fn() },
 			editor: {
 				setText(text: string) {
 					editorText = text;
@@ -71,7 +71,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 		let editorText = "[Paste #2, +2 lines]";
 		const prompt = vi.fn(async (_text: string, _options?: PromptOptionsLike) => {});
 		const ctx = {
-			eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
+			eventController: { onUserInput: vi.fn(), onEditorChange: vi.fn() },
 			editor: {
 				setText(text: string) {
 					editorText = text;

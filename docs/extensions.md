@@ -530,6 +530,7 @@ editor prevent idle execution. The cycle is consumed before handlers run and
 stays consumed after a skip or failure. Only a new main-editor submission
 (Enter or Ctrl+Enter) re-arms it; programmatic messages and background completions
 do not. Cycle state is scoped to the session.
+A selected model and existing conversation are required before handlers run.
 
 Return a prompt rather than calling `sendUserMessage` from the handler:
 
@@ -544,6 +545,8 @@ without another idle delay. Existing tool permissions and approval gates apply.
 New input or a draft invalidates the pending recap; the normal action turn keeps
 its usual steering semantics and its side effects are not rolled back.
 The 30-second handler budget does not limit the returned prompt's agent turn.
+Clearing an unsent draft restarts the delay for an already-pending, unconsumed
+cycle. It does not open a new cycle or repeat an action that already fired.
 
 #### External input interception
 

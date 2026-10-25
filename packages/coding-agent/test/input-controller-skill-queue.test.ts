@@ -103,7 +103,7 @@ function createStubInputControllerContext(opts: {
 	const setLoopPrompt = vi.fn((_prompt: string) => {});
 	const armLoopAutoSubmit = vi.fn();
 	const ctx = {
-		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
+		eventController: { onUserInput: vi.fn(), onEditorChange: vi.fn() },
 		editor,
 		ui: { requestRender },
 		skillCommands: opts.skillCommands,
