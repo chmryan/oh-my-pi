@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added the `before_idle_recap` extension event to await a normal agent prompt before generating the native recap. Idle recaps run once per human-input cycle; synthetic turns and background completions do not re-arm them.
+
 - Anthropic web search and Files API uploads follow `PI_ANTHROPIC_API_VERSION=2026-10-21`; web search omits `temperature` under that version ([#16706](https://github.com/can1357/oh-my-pi/pull/16706) by [@H4vC](https://github.com/H4vC))
 - llama.cpp auto-discovery now also finds local servers on llama-server's new default port 9931 when nothing answers on 8080 ([#16675](https://github.com/can1357/oh-my-pi/pull/16675) by [@bartbroere](https://github.com/bartbroere))
 

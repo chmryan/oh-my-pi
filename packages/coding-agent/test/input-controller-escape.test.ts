@@ -136,6 +136,7 @@ function createContext(): {
 	});
 
 	const ctx = {
+		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: {
 			requestRender,

@@ -496,6 +496,7 @@ Cancelable pre-events:
 - `agent_start` / `agent_end` — agent loop lifecycle notification; `agent_end` remains notification-only
 - `session_stop` — main-session stop hook, awaited before settle. Advisory `{ continue: true, additionalContext }` requests are capped at 8 continuations. Explicit `{ decision: "block", reason }` refusals take precedence over advisory requests, do not consume that allowance, and remain blocking until the hook allows completion or the operator interrupts. A refusal without a reason receives a diagnostic continuation rather than permission to finish. This event never fires for task/subagent sessions and defers until agent-owned background jobs are fully idle (`#hasPendingAsyncWake` in `session/agent-session.ts`).
 - `cache_warming_decision` — fired before each prompt-cache warming refresh with the warmer's economics (`warmCost`, `missCost`, `continuationProbability`, `action`). Return `{ action: "warm" | "stop" }` to override; the last handler returning an action wins, handler failures or answers slower than 2 seconds leave the warmer's decision standing, and a `"stop"` override ends warming until the next real request. Only the main agent loop warms; task/subagent sessions never fire this. The refresh itself replays the real request through the same provider path, so `before_provider_request` and `after_provider_response` fire for it too; a replacement payload must stay byte-identical to the real one for the refresh to hit the cache.
+- `before_idle_recap`: fired once per idle window before the native idle recap is generated, with `{ signal }`. `signal` aborts when the window ends (user input or cancellation); stop work once it does. Return `{ prompt?: string; skip?: boolean }`: non-empty `prompt`s from every handler join with newlines and run as one ordinary agent turn, and the native recap follows that turn; any `skip: true` vetoes the recap and that turn, and later handlers do not run. A handler error or timeout counts as `skip`, and an abort of `signal` skips without reporting an error. Handlers have the same 30 s budget as other non-tool events; a handler that exits without prompt or skip leaves the recap unchanged.
 - `turn_start` / `turn_end`
 - `assistant_message` — awaited once per finalized assistant message before agent context, persistence, `message_end`, or tool dispatch. Return `{ content }` to replace text for history, persistence, `message_end` consumers, and the next provider request; handlers chain. Text already delivered through streaming updates (`message_update`, ACP/RPC chunks) is not retracted, so clients that render from the stream may keep showing the original text. Text blocks must retain their count, order, and positions; only their text may change. All non-text blocks and other block metadata must remain unchanged. Unchanged text retains its original `textSignature` (even if the handler drops or changes it); edited text loses its signature so provider replay state is never reused for different text. Invalid replacements and handler errors are reported and skipped. If aborted while a handler is pending, completed rewrites so far are retained and remaining handlers are skipped.
 - `message_start` / `message_update` / `message_end` — lifecycle notifications; `message_end` receives a detached snapshot, so in-place changes cannot rewrite agent or provider context
@@ -521,6 +522,29 @@ Handlers must tolerate re-entry: a source-base retry can call the entire `before
 If a later queue drain fails, earlier originals that have not reached the
 transcript are restored ahead of newer enqueues. Generated preparation context
 is not requeued, and explicitly cleared or replaced queues are not resurrected.
+#### Idle recap preparation
+
+The interactive TUI arms its native timer after an agent run settles, using
+`recap.idleSeconds` (240 seconds by default). Streaming, compaction and a nonempty
+editor prevent idle execution. The cycle is consumed before handlers run and
+stays consumed after a skip or failure. Only a new main-editor submission
+(Enter or Ctrl+Enter) re-arms it; programmatic messages and background completions
+do not. Cycle state is scoped to the session.
+
+Return a prompt rather than calling `sendUserMessage` from the handler:
+
+```ts
+pi.on("before_idle_recap", () => ({
+  prompt: "Capture the durable findings from the completed work.",
+}));
+```
+
+OMP awaits that normal agent turn, then generates the native recap immediately,
+without another idle delay. Existing tool permissions and approval gates apply.
+New input or a draft invalidates the pending recap; the normal action turn keeps
+its usual steering semantics and its side effects are not rolled back.
+The 30-second handler budget does not limit the returned prompt's agent turn.
+
 #### External input interception
 
 `input` runs once at submission ingress, before command interpretation, skill or

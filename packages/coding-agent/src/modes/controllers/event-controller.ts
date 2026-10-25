@@ -36,7 +36,7 @@ import { getSymbolTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import {
 	isSilentAbort,
 	isUserInvokedSkillPrompt,
@@ -277,6 +277,13 @@ export class EventController {
 	// In-flight ephemeral recap turn; aborted by #cancelIdleRecap when any
 	// activity (new turn, compaction, editor draft) supersedes the idle recap.
 	#idleRecapAbort?: AbortController;
+	// Human-input cycles already fired, per session object then session id, so a
+	// session switch or fork cannot consume another session's cycle. Absent means
+	// unconsumed; only real human input (`onUserInput`) reopens a fired cycle.
+	#consumedRecapCycles = new WeakMap<AgentSession, Set<string>>();
+	// Owned pre-recap prompt (`before_idle_recap` action) for one session and id. Its
+	// own agent_start / agent_end must neither cancel the pending recap nor rearm it.
+	#ownedRecapAction?: { session: AgentSession; sessionId: string };
 	/** Next-message prediction offered as composer ghost text after a completed turn. */
 	readonly composerPrediction: ComposerPredictionController;
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
@@ -462,6 +469,24 @@ export class EventController {
 	refreshIdleRecapTimer(): void {
 		if (!this.#idleRecapPending || this.ctx.viewSession.isStreaming) return;
 		this.#scheduleIdleRecap();
+	}
+
+	/**
+	 * Real human input in the main editor (Enter / Ctrl+Enter, not synthetic or
+	 * programmatic work). Starts a new idle-recap cycle and cancels any pending
+	 * timer or in-flight recap work from the previous cycle.
+	 */
+	onUserInput(): void {
+		this.#consumedRecapCycles.get(this.ctx.viewSession)?.delete(this.ctx.sessionManager.getSessionId());
+		this.#cancelIdleRecapWindow();
+	}
+
+	/**
+	 * A non-empty editor draft cancels pending or in-flight recap work for the
+	 * current cycle without rearming it: typing alone does not start a new cycle.
+	 */
+	cancelIdleRecapForDraft(): void {
+		this.#cancelIdleRecapWindow();
 	}
 
 	dispose(): void {
@@ -1128,7 +1153,9 @@ export class EventController {
 			this.ctx.statusContainer.disposeChildren();
 		}
 		this.#cancelIdleCompaction();
-		this.#cancelIdleRecap();
+		// The owned pre-recap action starts its own turn under the recap signal; that
+		// start must not cancel the recap it serves. Human input cancels via onUserInput.
+		if (!this.#ownsRecapAction()) this.#cancelIdleRecap();
 		this.composerPrediction.cancel();
 		this.ctx.statusLine.markActivityStart();
 		// The turn owns progress from here; a compaction that started it hands it over.
@@ -2429,9 +2456,10 @@ export class EventController {
 		this.ctx.syncRetryHintRow();
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
-		this.#idleRecapPending = true;
-		this.#scheduleIdleRecap();
-		if (this.#settledRunStatus(event).state === "done") this.composerPrediction.request();
+		this.#idleRecapPending = this.#armIdleRecapCycle();
+		if (this.#idleRecapPending) this.#scheduleIdleRecap();
+		// The owned pre-recap action's own settle must not bill a prediction call.
+		if (this.#settledRunStatus(event).state === "done" && !this.#ownsRecapAction()) this.composerPrediction.request();
 		this.sendErrorNotification(event);
 		this.sendCompletionNotification(event);
 	}
@@ -2845,6 +2873,43 @@ export class EventController {
 		return model !== undefined && isPromptCachePersistent(model);
 	}
 
+	/** The viewed main session and id are still `session`/`sessionId`; every recap continuation gates on this. */
+	#isViewedRecapSession(session: AgentSession, sessionId: string): boolean {
+		return this.ctx.viewSession === session && this.ctx.sessionManager.getSessionId() === sessionId;
+	}
+
+	/** The owned pre-recap action guards only its own session and id, not whatever session is viewed. */
+	#ownsRecapAction(): boolean {
+		const owned = this.#ownedRecapAction;
+		return owned !== undefined && this.#isViewedRecapSession(owned.session, owned.sessionId);
+	}
+
+	#consumeRecapCycle(session: AgentSession, sessionId: string): void {
+		let ids = this.#consumedRecapCycles.get(session);
+		if (!ids) {
+			ids = new Set();
+			this.#consumedRecapCycles.set(session, ids);
+		}
+		ids.add(sessionId);
+	}
+
+	/** Cancels the pending window and any in-flight recap work; cycle state is not touched. */
+	#cancelIdleRecapWindow(): void {
+		this.#cancelIdleRecap();
+		this.#idleRecapPending = false;
+	}
+
+	/**
+	 * Arm the idle recap for this settle. Returns false (no timer) when the cycle
+	 * already fired, or while the viewed session's owned pre-recap action runs:
+	 * its own `agent_end` must not rearm the cycle it is serving.
+	 */
+	#armIdleRecapCycle(): boolean {
+		if (this.#ownsRecapAction()) return false;
+		const consumed = this.#consumedRecapCycles.get(this.ctx.viewSession);
+		return !consumed?.has(this.ctx.sessionManager.getSessionId());
+	}
+
 	#scheduleIdleRecap(): void {
 		this.#cancelIdleRecap();
 		if (this.ctx.viewSession.isCompacting) return;
@@ -2858,9 +2923,80 @@ export class EventController {
 		this.#idleRecapTimer = setTimeout(() => {
 			this.#idleRecapTimer = undefined;
 			this.#idleRecapPending = false;
-			void this.#runIdleRecap();
+			void this.#fireIdleRecap();
 		}, timeoutMs);
 		this.#idleRecapTimer.unref?.();
+	}
+
+	/**
+	 * Timer fire for one human-input cycle. The cycle is consumed before any await
+	 * so nothing else can fire it twice. Extension pre-recap work runs first, as an
+	 * owned prompt; its success (or a skip) decides whether the recap is shown.
+	 */
+	async #fireIdleRecap(): Promise<void> {
+		if (!this.#idleConditionsHold()) return;
+		const session = this.ctx.viewSession;
+		const sessionId = this.ctx.sessionManager.getSessionId();
+		this.#consumeRecapCycle(session, sessionId);
+		const abort = new AbortController();
+		this.#idleRecapAbort = abort;
+		try {
+			const pre = await session.extensionRunner?.emitBeforeIdleRecap({ signal: abort.signal });
+			if (this.#idleRecapAbort !== abort || abort.signal.aborted || pre?.skip) return;
+			if (pre?.prompt) {
+				const actionOk = await this.#runOwnedRecapAction(session, sessionId, pre.prompt, abort.signal);
+				// A human reset during the action had its settle suppressed by the owned guard.
+				this.#rearmAfterOwnedAction(session, sessionId);
+				if (!actionOk) return;
+			}
+			await this.#runIdleRecap(abort, session, sessionId);
+		} catch (error) {
+			if (!abort.signal.aborted) logger.debug("Idle recap cycle failed", { error: String(error) });
+		} finally {
+			if (this.#idleRecapAbort === abort) this.#idleRecapAbort = undefined;
+		}
+	}
+
+	/**
+	 * Runs the extension-supplied pre-recap prompt as an ordinary agent turn owned by
+	 * this recap cycle. Its own agent_start / agent_end are ignored by the recap
+	 * machinery (see `#ownedRecapAction`). Returns true only when the turn completed
+	 * with a usable assistant message and the same session and signal are still live.
+	 */
+	async #runOwnedRecapAction(
+		session: AgentSession,
+		sessionId: string,
+		promptText: string,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		const owned = { session, sessionId };
+		this.#ownedRecapAction = owned;
+		try {
+			const accepted = await session.prompt(promptText, { userInitiated: false });
+			if (!accepted || signal.aborted || !this.#isViewedRecapSession(session, sessionId)) return false;
+			const last = session.getLastAssistantMessage();
+			return last !== undefined && last.stopReason !== "error" && last.stopReason !== "aborted";
+		} catch (error) {
+			logger.debug("Idle recap cycle failed", { error: String(error) });
+			return false;
+		} finally {
+			if (this.#ownedRecapAction === owned) this.#ownedRecapAction = undefined;
+		}
+	}
+
+	/**
+	 * The owned action settled. A human reset that landed during it had its settle
+	 * suppressed by the owned guard, so the fresh cycle is armed here. Nothing arms when
+	 * the cycle fired (consumed), a timer or recap already owns the window, a turn is
+	 * live (its own settle arms), or the session is no longer the viewed one.
+	 */
+	#rearmAfterOwnedAction(session: AgentSession, sessionId: string): void {
+		if (!this.#isViewedRecapSession(session, sessionId)) return;
+		const consumed = this.#consumedRecapCycles.get(this.ctx.viewSession);
+		if (consumed?.has(this.ctx.sessionManager.getSessionId())) return;
+		if (this.#idleRecapTimer || this.#idleRecapAbort || session.isStreaming) return;
+		this.#idleRecapPending = true;
+		this.#scheduleIdleRecap();
 	}
 
 	/**
@@ -2869,34 +3005,29 @@ export class EventController {
 	 * ({@link RecapNotice}), and journal it to history.db (`session_recaps`) for the session that
 	 * produced it. Live goal/title and the active todo task are passed as anchoring
 	 * hints because the snapshot only carries conversation history, not the
-	 * controller's todo/goal state. The request is abortable: any activity
-	 * cancels it via #cancelIdleRecap, and idle conditions are re-checked after
-	 * the reply lands so a stale recap never paints over fresh work.
+	 * controller's todo/goal state. Abortable through `abort`; idle conditions are
+	 * re-checked after the reply lands so a stale recap never paints over fresh work.
 	 */
-	async #runIdleRecap(): Promise<void> {
-		if (!this.#idleConditionsHold()) return;
-		if (!this.ctx.viewSession.model) return;
-		if (this.ctx.viewSession.messages.length === 0) return;
+	async #runIdleRecap(abort: AbortController, session: AgentSession, sessionId: string): Promise<void> {
+		if (!this.#isViewedRecapSession(session, sessionId) || !this.#idleConditionsHold()) return;
+		if (!session.model) return;
+		if (session.messages.length === 0) return;
 
 		const promptText = prompt.render(idleRecapPrompt, {
 			goal: this.#idleRecapGoalText() ?? "",
 			task: nextActionableTask(this.ctx.todoPhases)?.content ?? "",
 		});
 
-		const abort = new AbortController();
-		this.#idleRecapAbort = abort;
 		try {
-			const session = this.ctx.viewSession;
 			const { replyText } = await session.runEphemeralTurn({ promptText, signal: abort.signal });
 			if (this.#idleRecapAbort !== abort || abort.signal.aborted || !this.#idleConditionsHold()) return;
+			if (!this.#isViewedRecapSession(session, sessionId)) return;
 			const recap = previewLine(replyText, TRUNCATE_LENGTHS.RECAP);
 			if (!recap) return;
 			session.sessionManager.recordRecap(replyText);
 			this.ctx.present(new RecapNotice(recap));
 		} catch (error) {
-			if (!abort.signal.aborted) logger.debug("Idle recap turn failed", { error: String(error) });
-		} finally {
-			if (this.#idleRecapAbort === abort) this.#idleRecapAbort = undefined;
+			if (!abort.signal.aborted) logger.debug("Idle recap cycle failed", { error: String(error) });
 		}
 	}
 

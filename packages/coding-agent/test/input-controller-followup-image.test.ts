@@ -69,6 +69,7 @@ function createContext(opts: {
 	const handlePlanModeCommand = vi.fn(async (_prompt?: string, _input?: unknown) => true);
 	const handleVibeModeCommand = vi.fn(async (_prompt?: string, _input?: unknown) => true);
 	const ctx = {
+		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
 		editor,
 		ui: { requestRender },
 		skillCommands: new Map<string, string>(),

@@ -1085,6 +1085,15 @@ export interface BeforeSubagentSpawnEvent {
 	spawnKey?: string;
 }
 
+/**
+ * Fired once per idle recap, before the native recap is generated. `signal` aborts when the idle window
+ * ends (user input or cancellation); handlers should stop work once it does.
+ */
+export interface BeforeIdleRecapEvent {
+	type: "before_idle_recap";
+	signal: AbortSignal;
+}
+
 export type {
 	AgentEndEvent,
 	AgentStartEvent,
@@ -1475,6 +1484,7 @@ export type ExtensionEvent =
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| BeforeSubagentSpawnEvent
+	| BeforeIdleRecapEvent
 	| AgentStartEvent
 	| AgentEndEvent
 	| SessionStopEvent
@@ -1574,6 +1584,16 @@ export interface BeforeSubagentSpawnEventResult {
 	reason?: string;
 	/** Human-readable routing explanation surfaced with the resolved model. */
 	note?: string;
+}
+
+/**
+ * Result from a `before_idle_recap` handler. Non-empty `prompt`s from all handlers join with newlines and run
+ * as one ordinary agent turn before the native recap. `skip` vetoes the recap and any action. A handler error,
+ * timeout, or an abort of `signal` counts as `skip`.
+ */
+export interface BeforeIdleRecapEventResult {
+	prompt?: string;
+	skip?: boolean;
 }
 
 export type {
@@ -1681,6 +1701,7 @@ export interface ExtensionAPI {
 		event: "before_subagent_spawn",
 		handler: ExtensionHandler<BeforeSubagentSpawnEvent, BeforeSubagentSpawnEventResult>,
 	): void;
+	on(event: "before_idle_recap", handler: ExtensionHandler<BeforeIdleRecapEvent, BeforeIdleRecapEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "session_stop", handler: ExtensionHandler<SessionStopEvent, SessionStopEventResult>): void;

@@ -167,6 +167,7 @@ async function createContext() {
 	focused = editor;
 	const ctx = {
 		editor: editor as unknown as InteractiveModeContext["editor"],
+		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
 		resetDisplayAfterAppearanceRefresh,
 		ui: {
 			requestRender,

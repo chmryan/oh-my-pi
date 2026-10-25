@@ -64,6 +64,7 @@ async function createHarness(factory: ExtensionFactory) {
 	};
 	const ctx = {
 		editor,
+		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
 		session,
 		viewSession: session,
 		sessionManager,

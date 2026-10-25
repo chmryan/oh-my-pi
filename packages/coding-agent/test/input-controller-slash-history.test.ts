@@ -49,6 +49,7 @@ function makeCtx(isStreaming = false, messages: AgentMessage[] = []) {
 	const locallySubmittedUserSignatures = new Set<string>();
 	const sessionManager = { sessionId: "session-a", getSessionId: () => sessionManager.sessionId };
 	const ctx = {
+		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
 		editor,
 		sessionManager,
 		session: {

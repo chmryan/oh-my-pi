@@ -51,6 +51,8 @@ import type {
 	AssistantThinkingRenderer,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
+	BeforeIdleRecapEvent,
+	BeforeIdleRecapEventResult,
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
 	BeforeSubagentSpawnEvent,
@@ -399,6 +401,7 @@ type RunnerEmitEvent = Exclude<
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
+	| BeforeIdleRecapEvent
 	| ResourcesDiscoverEvent
 	| InputEvent
 >;
@@ -2282,6 +2285,42 @@ export class ExtensionRunner {
 		}
 
 		return undefined;
+	}
+
+	/**
+	 * Runs `before_idle_recap` handlers once before the native idle recap. Non-empty `prompt`s join with newlines
+	 * in handler order. The first `skip` short-circuits later handlers. A handler error or timeout fails closed,
+	 * and an aborted `signal` also skips, so a cancelled idle cycle cannot reach the recap.
+	 */
+	async emitBeforeIdleRecap({ signal }: { signal: AbortSignal }): Promise<BeforeIdleRecapEventResult> {
+		if (signal.aborted) return { skip: true };
+		if (!this.hasHandlers("before_idle_recap")) return {};
+		const ctx = this.createContext();
+		const prompts: string[] = [];
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("before_idle_recap");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				const event: BeforeIdleRecapEvent = { type: "before_idle_recap", signal };
+				const result = (await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					extensionHandlerTimeoutMs,
+					() => ({ skip: true }),
+					signal,
+				)) as BeforeIdleRecapEventResult | undefined;
+				if (signal.aborted || result?.skip) return { skip: true };
+				if (isNonBlankContext(result?.prompt)) {
+					prompts.push(result.prompt);
+				}
+			}
+		}
+
+		return prompts.length > 0 ? { prompt: prompts.join("\n") } : {};
 	}
 
 	/**

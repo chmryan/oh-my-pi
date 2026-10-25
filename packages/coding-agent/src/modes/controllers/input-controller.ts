@@ -744,7 +744,10 @@ export class InputController {
 			this.#draftText = text;
 			// Typing signals an imminent turn; refresh the API connection now so
 			// the handshake overlaps composition instead of delaying the send.
-			if (text) this.ctx.session.prewarmModelConnection();
+			if (text) {
+				this.ctx.session.prewarmModelConnection();
+				this.ctx.eventController.cancelIdleRecapForDraft();
+			}
 			const wasBashMode = this.ctx.isBashMode;
 			const wasPythonMode = this.ctx.isPythonMode;
 			const trimmed = text.trimStart();
@@ -989,6 +992,7 @@ export class InputController {
 			}
 
 			if (!text && !hasPendingImages) return;
+			this.ctx.eventController.onUserInput();
 
 			// Continue shortcuts: "." or "c" resume the agent with a hidden agent-authored
 			// developer directive (no visible user message) instead of an empty turn, so the
@@ -1889,6 +1893,7 @@ export class InputController {
 			await this.#submitToFocusedSession(text, "followUp");
 			return;
 		}
+		this.ctx.eventController.onUserInput();
 
 		// Detach before the first await: another Ctrl+Enter cannot submit the
 		// same draft, and later typing belongs to the next submission.

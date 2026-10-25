@@ -37,6 +37,7 @@ function createLoopContext(options: {
 		setCollapsedText: vi.fn(),
 	} as unknown as InteractiveModeContext["editor"];
 	const ctx = {
+		eventController: { onUserInput: vi.fn(), cancelIdleRecapForDraft: vi.fn() },
 		editor,
 		ui: { requestRender: vi.fn() },
 		session: {
